@@ -1,5 +1,6 @@
 import base64
 
+import asyncssh
 import pytest
 from starlette.requests import Request
 
@@ -11,6 +12,7 @@ from ssh_mcp.app import (
     _TofuClient,
     elicit_missing_ssh_args,
     extract_credentials,
+    run_ssh_command,
 )
 from ssh_mcp.hostkeys import HostKeyStore
 
@@ -218,3 +220,43 @@ async def test_elicit_accept_without_answering_asked_field_is_treated_as_no_answ
     )
     result = await elicit_missing_ssh_args(session, {"host": "example.com"})
     assert result is None
+
+
+# Regression coverage for a real incident: asyncssh.KeyEncryptionError is
+# NOT a subclass of asyncssh.KeyImportError (both are ValueError, with no
+# closer common asyncssh base) -- an except clause narrowed to just
+# KeyImportError lets a wrong passphrase, or bcrypt genuinely missing from
+# the environment (own separate incident, fixed by asyncssh[bcrypt] in
+# pyproject.toml), crash the tool call with an unhandled exception instead
+# of returning the clean {"ok": false, "error": {"code": "invalid_key"}}
+# every other failure mode in run_ssh_command produces.
+
+
+@pytest.mark.asyncio
+async def test_run_ssh_command_wrong_passphrase_is_a_clean_error(tmp_path):
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    encrypted = key.export_private_key(passphrase="correct-horse")
+    store = HostKeyStore(str(tmp_path / "host_keys.json"))
+
+    result = await run_ssh_command(
+        store, encrypted, "wrong-passphrase", "example.com", 22, "user", "true", 5,
+    )
+
+    assert result == {
+        "ok": False,
+        "error": {"code": "invalid_key", "message": "Incorrect passphrase"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_ssh_command_missing_passphrase_for_encrypted_key_is_a_clean_error(tmp_path):
+    key = asyncssh.generate_private_key("ssh-ed25519")
+    encrypted = key.export_private_key(passphrase="correct-horse")
+    store = HostKeyStore(str(tmp_path / "host_keys.json"))
+
+    result = await run_ssh_command(
+        store, encrypted, None, "example.com", 22, "user", "true", 5,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid_key"

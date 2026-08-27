@@ -274,7 +274,15 @@ async def run_ssh_command(
 ) -> dict[str, Any]:
     try:
         client_key = asyncssh.import_private_key(key_bytes, passphrase=passphrase)
-    except asyncssh.KeyImportError as exc:
+    except ValueError as exc:
+        # Covers asyncssh.KeyImportError (malformed/unsupported key data,
+        # missing passphrase for an encrypted key) and
+        # asyncssh.KeyEncryptionError (wrong passphrase, or -- the bug that
+        # motivated this being ValueError instead of the narrower
+        # KeyImportError -- "bcrypt with KDF support" required but missing
+        # if asyncssh wasn't installed with the [bcrypt] extra). Neither
+        # asyncssh exception is a subclass of the other; ValueError is
+        # their nearest common, asyncssh-documented base.
         return {"ok": False, "error": {"code": "invalid_key", "message": str(exc)}}
 
     try:
