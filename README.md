@@ -1,32 +1,11 @@
 # ssh-mcp
 
-Per-user SSH command execution for LibreChat assistants: `ssh_exec(host,
-port, username, command)`, authenticated with the calling chat user's own
-personal SSH private key -- never a shared service account. A second tool,
-`ssh_generate_keypair`, generates a fresh keypair on request for users who
-don't already have one. Deployed as a plain streamable-HTTP Docker service
-(no `ports:` exposed publicly, no per-user OAuth at the MCP layer), same
-shape as `ews-mcp`'s multi-user mode and `jenkins-mcp`.
-
-## `ssh_generate_keypair`
-
-Generates a new Ed25519 (default) or RSA keypair server-side and returns
-it in the tool response: `private_key_base64` -- ready to paste straight
-into the `SSH_PRIVATE_KEY` customUserVars field -- and `public_key`, to
-add to `authorized_keys` on whatever target hosts should accept it.
-Nothing is persisted; the key exists only for the duration of that one
-tool call and in whatever the user does with the response afterwards.
-
-**This is "generate, then copy-paste once," not a real one-click flow.**
-LibreChat has no API for a tool response to write back into another
-field's `customUserVars` store, so the user still has to manually paste
-the returned private key into Settings themselves. A true one-click
-button would require patching LibreChat's own frontend, which breaks the
-"vanilla LibreChat + MCP" pattern the rest of this stack relies on -- not
-attempted here.
-
-Needs no credentials itself (pure keygen, no target host involved), so it
-works even before a user has any `SSH_PRIVATE_KEY` configured at all.
+Per-user SSH command execution for LibreChat assistants: one tool,
+`ssh_exec(host, port, username, command)`, authenticated with the calling
+chat user's own personal SSH private key -- never a shared service
+account. Deployed as a plain streamable-HTTP Docker service (no `ports:`
+exposed publicly, no per-user OAuth at the MCP layer), same shape as
+`ews-mcp`'s multi-user mode and `jenkins-mcp`.
 
 ## Why this exists (and why it's custom code, not a wrapper)
 
@@ -130,7 +109,7 @@ later change" property until the fleet's been re-contacted once).
 
 ```yaml
   ssh-mcp:
-    build: /home/bos/ssh-mcp   # git clone https://github.com/thekk1/ssh-mcp
+    image: ssh-mcp   # or a registry tag, once built/pushed
     container_name: ssh-mcp
     volumes:
       - ssh-mcp-hostkeys:/data
@@ -186,11 +165,7 @@ first contact, acceptance on a matching second contact, hard rejection on
 a changed/mismatched host key, a garbage private key rejected as
 `invalid_key`, an unauthorized key rejected as `connection_failed`, and a
 non-zero remote exit code passed through as `ok: true` with that exit
-code (not treated as a tool failure). `ssh_generate_keypair` was checked
-the same way: generated a key exactly as the tool does, then used that
-same key (nothing else) to authenticate `ssh_exec` against the throwaway
-server -- confirms a generated key is a real, usable key, not just a
-plausible-looking one.
+code (not treated as a tool failure).
 
 ## Test
 
@@ -199,10 +174,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Unit tests (credential-header parsing, TOFU pin/accept/reject logic, tool
-schemas, keypair generation including the passphrase-encrypted case) --
-`asyncssh[bcrypt]` is required for that last one; plain `asyncssh` raises
-`KeyExportError` on any passphrase-protected OpenSSH-format export. No
-real network or subprocess in the automated suite; the real-handshake
-scenarios above (including the generate -> exec round trip) were run
-manually against a throwaway local SSH server.
+Unit tests only (credential-header parsing, TOFU pin/accept/reject logic,
+tool schema) -- no real network or subprocess. The real-handshake
+scenarios above were run manually against a throwaway local SSH server,
+not part of the automated suite.

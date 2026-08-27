@@ -1,18 +1,15 @@
 import base64
 
-import asyncssh
 import pytest
 from starlette.requests import Request
 
 from ssh_mcp.app import (
-    GENERATE_TOOL,
     PASSPHRASE_HEADER,
     PRIVATE_KEY_HEADER,
     TOOL,
     CredentialError,
     _TofuClient,
     extract_credentials,
-    generate_keypair,
 )
 from ssh_mcp.hostkeys import HostKeyStore
 
@@ -99,51 +96,3 @@ def test_tofu_client_rejects_mismatched_key(tmp_path):
     )
     assert accepted is False
     assert store.get("example.com", 22) == "sha256:aaa"
-
-
-def test_generate_tool_has_no_required_arguments():
-    assert GENERATE_TOOL.inputSchema.get("required", []) == []
-
-
-def test_generate_keypair_default_is_ed25519_and_loadable():
-    result = generate_keypair(key_type="ed25519", passphrase=None, comment=None)
-    assert result["ok"] is True
-    assert result["public_key"].startswith("ssh-ed25519 ")
-
-    private_bytes = base64.b64decode(result["private_key_base64"])
-    key = asyncssh.import_private_key(private_bytes)
-    assert key.get_fingerprint("sha256") == result["fingerprint"]
-
-
-def test_generate_keypair_rsa():
-    result = generate_keypair(key_type="rsa", passphrase=None, comment=None)
-    assert result["ok"] is True
-    assert result["public_key"].startswith("ssh-rsa ")
-
-
-def test_generate_keypair_unknown_type_is_an_error():
-    result = generate_keypair(key_type="not-a-real-type", passphrase=None, comment=None)
-    assert result["ok"] is False
-    assert result["error"]["code"] == "invalid_key_type"
-
-
-def test_generate_keypair_comment_appears_in_public_key():
-    result = generate_keypair(key_type="ed25519", passphrase=None, comment="test@example.com")
-    assert result["public_key"].endswith("test@example.com")
-
-
-def test_generate_keypair_passphrase_protects_private_key():
-    result = generate_keypair(key_type="ed25519", passphrase="s3cr3t", comment=None)
-    private_bytes = base64.b64decode(result["private_key_base64"])
-
-    with pytest.raises(asyncssh.KeyImportError):
-        asyncssh.import_private_key(private_bytes)  # no passphrase given -> must fail
-
-    key = asyncssh.import_private_key(private_bytes, passphrase="s3cr3t")
-    assert key.get_fingerprint("sha256") == result["fingerprint"]
-
-
-def test_generate_keypair_is_fresh_every_call():
-    first = generate_keypair(key_type="ed25519", passphrase=None, comment=None)
-    second = generate_keypair(key_type="ed25519", passphrase=None, comment=None)
-    assert first["fingerprint"] != second["fingerprint"]

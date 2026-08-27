@@ -65,10 +65,7 @@ _INSTRUCTIONS = (
     "ausschliesslich vom Unix-Account, zu dem der hinterlegte Key gehoert. "
     "Host-Keys werden per Trust-On-First-Use gepinnt -- bei einer "
     "Aenderung gegenueber dem ersten Kontakt schlaegt die Verbindung fehl, "
-    "statt sie stillschweigend zu akzeptieren. Ein zweites Tool, "
-    "ssh_generate_keypair, erzeugt bei Bedarf ein neues Schluesselpaar --"
-    " der private Teil wird nirgends gespeichert, nur einmalig in der "
-    "Tool-Antwort zurueckgegeben."
+    "statt sie stillschweigend zu akzeptieren."
 )
 
 TOOL = types.Tool(
@@ -96,46 +93,6 @@ TOOL = types.Tool(
     },
     annotations=types.ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
-    ),
-)
-
-# alg_name values asyncssh.generate_private_key expects, keyed by the
-# short name exposed in the tool's input schema.
-_KEY_TYPE_ALGS = {"ed25519": "ssh-ed25519", "rsa": "ssh-rsa"}
-
-GENERATE_TOOL = types.Tool(
-    name="ssh_generate_keypair",
-    description=(
-        "Erzeugt ein neues SSH-Schluesselpaar (Ed25519 per Default, RSA "
-        "auf Wunsch). Der private Schluessel wird nirgends gespeichert -- "
-        "nur in dieser einen Antwort zurueckgegeben, Base64-kodiert, zum "
-        "Einfuegen in das SSH_PRIVATE_KEY-Feld in LibreChat. Der oeffentliche "
-        "Schluessel muss zusaetzlich manuell in die authorized_keys der "
-        "gewuenschten Zielserver eingetragen werden -- dieses Tool tut das "
-        "nicht selbst."
-    ),
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "key_type": {
-                "type": "string",
-                "enum": sorted(_KEY_TYPE_ALGS),
-                "default": "ed25519",
-                "description": "Schluesseltyp",
-            },
-            "passphrase": {
-                "type": "string",
-                "description": "Optional: verschluesselt den privaten Schluessel mit dieser Passphrase",
-            },
-            "comment": {
-                "type": "string",
-                "description": "Optionaler Kommentar im oeffentlichen Schluessel (z.B. eine E-Mail-Adresse)",
-            },
-        },
-        "required": [],
-    },
-    annotations=types.ToolAnnotations(
-        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
     ),
 )
 
@@ -265,55 +222,15 @@ async def run_ssh_command(
             await conn.wait_closed()
 
 
-def generate_keypair(
-    key_type: str, passphrase: Optional[str], comment: Optional[str],
-) -> dict[str, Any]:
-    """Pure, synchronous, no I/O -- nothing here touches disk or any
-    per-request header, so unlike run_ssh_command this needs no
-    credentials at all and works without a request context.
-    """
-
-    alg_name = _KEY_TYPE_ALGS.get(key_type)
-    if alg_name is None:
-        return {
-            "ok": False,
-            "error": {
-                "code": "invalid_key_type",
-                "message": (
-                    f"Unsupported key_type {key_type!r}, expected one of "
-                    f"{sorted(_KEY_TYPE_ALGS)}"
-                ),
-            },
-        }
-
-    key = asyncssh.generate_private_key(alg_name, comment=comment)
-    private_key_bytes = key.export_private_key(passphrase=passphrase or None)
-    public_key_bytes = key.export_public_key()
-    return {
-        "ok": True,
-        "private_key_base64": base64.b64encode(private_key_bytes).decode(),
-        "public_key": public_key_bytes.decode().strip(),
-        "fingerprint": key.get_fingerprint("sha256"),
-    }
-
-
 def build_server(store: HostKeyStore) -> Server:
     server: Server = Server("ssh-mcp", instructions=_INSTRUCTIONS)
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return [TOOL, GENERATE_TOOL]
+        return [TOOL]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-        if name == GENERATE_TOOL.name:
-            payload = generate_keypair(
-                key_type=arguments.get("key_type", "ed25519"),
-                passphrase=arguments.get("passphrase"),
-                comment=arguments.get("comment"),
-            )
-            return [types.TextContent(type="text", text=json.dumps(payload))]
-
         if name != TOOL.name:
             payload = {
                 "ok": False,
