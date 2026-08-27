@@ -7,7 +7,7 @@ dependencies = [
   "mcp>=1.29,<2",
   "starlette>=0.37",
   "uvicorn>=0.30",
-  "asyncssh>=2.24,<3",
+  "asyncssh[bcrypt]>=2.24,<3",
 ]
 
 [project.optional-dependencies]
