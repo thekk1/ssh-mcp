@@ -109,7 +109,7 @@ later change" property until the fleet's been re-contacted once).
 
 ```yaml
   ssh-mcp:
-    image: ssh-mcp   # or a registry tag, once built/pushed
+    build: /home/bos/ssh-mcp   # git clone https://github.com/thekk1/ssh-mcp
     container_name: ssh-mcp
     volumes:
       - ssh-mcp-hostkeys:/data
