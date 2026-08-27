@@ -69,6 +69,29 @@ makes LibreChat's non-OAuth MCP client try (and get stuck on) OAuth.
 Docker network isolation is the transport-level boundary; real access
 control lives one layer up, in LibreChat.
 
+## Missing username: asked via MCP elicitation, not guessed by the model
+
+`username` is deliberately **not** in the tool's `required` schema fields.
+Making it required would make a spec-compliant model refuse to even call
+the tool without it and improvise a plain-text follow-up question itself
+instead -- which is exactly the bad UX this replaces. When `username` is
+missing, `ssh_mcp/app.py`'s `elicit_username()` asks the *human* directly
+via [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+(`elicitation/create`, form mode) -- a real client-rendered form, not
+something the model has to phrase itself.
+
+**This degrades safely if the client doesn't support it.** LibreChat's own
+elicitation support is unconfirmed/in-progress upstream as of this writing
+([Discussion #8681](https://github.com/danny-avila/LibreChat/discussions/8681),
+PR #12938) -- not something to build on blindly. `elicit_username()` checks
+`session.check_client_capability(...)` before ever sending the request, and
+catches any failure from the call itself; either way it falls back to a
+plain `missing_username` error the model can still relay as a text
+question, rather than the tool call erroring out or hanging. Verified with
+a real `ClientSession` via `mcp.shared.memory`'s in-memory transport, both
+with and without an `elicitation_callback` registered, plus the
+accept/decline/cancel branches -- not just asserted from reading the spec.
+
 ## Restricting visibility to specific users
 
 **No SSO/Bearer validation needed inside this MCP.** LibreChat itself
@@ -174,7 +197,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Unit tests only (credential-header parsing, TOFU pin/accept/reject logic,
-tool schema) -- no real network or subprocess. The real-handshake
-scenarios above were run manually against a throwaway local SSH server,
-not part of the automated suite.
+Unit tests (credential-header parsing, TOFU pin/accept/reject logic, tool
+schema, `elicit_username`'s capability-check/accept/decline/cancel/failure
+branches against a fake session) -- no real network, subprocess, or MCP
+transport. The real-handshake scenarios and the real `ClientSession`
+elicitation round trip (see above) were run manually, not part of the
+automated suite.

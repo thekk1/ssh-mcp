@@ -22,6 +22,16 @@ Host key handling is genuine TOFU (see hostkeys.HostKeyStore) -- first
 contact to a host:port pins its key fingerprint, every later connection
 must match it exactly or gets refused, rather than trusting every
 handshake unconditionally.
+
+'username' is optional in the tool schema on purpose: when it's missing,
+this server asks the human directly via MCP elicitation (a real form,
+requested through the client, see elicit_username()) instead of leaving
+it to the model to guess or ask in free text. LibreChat's elicitation
+support is unconfirmed/in-progress upstream as of this writing (see
+README) -- elicit_username() checks the client's declared capability
+first and falls back to a plain missing_username error if the client
+doesn't support it, so behavior degrades to "the model asks in text"
+rather than crashing the tool call.
 """
 
 from __future__ import annotations
@@ -65,7 +75,11 @@ _INSTRUCTIONS = (
     "ausschliesslich vom Unix-Account, zu dem der hinterlegte Key gehoert. "
     "Host-Keys werden per Trust-On-First-Use gepinnt -- bei einer "
     "Aenderung gegenueber dem ersten Kontakt schlaegt die Verbindung fehl, "
-    "statt sie stillschweigend zu akzeptieren."
+    "statt sie stillschweigend zu akzeptieren. Fehlt der SSH-Benutzername, "
+    "wird er per MCP-Elicitation direkt beim Menschen abgefragt (Formular "
+    "mit dem unterstuetzenden Client), nicht vom Modell erraten oder per "
+    "Fliesstext-Rueckfrage erfragt -- Clients ohne Elicitation-Unterstuetzung "
+    "bekommen stattdessen einen klaren missing_username-Fehler zurueck."
 )
 
 TOOL = types.Tool(
@@ -74,14 +88,24 @@ TOOL = types.Tool(
         "Fuehrt einen Shell-Befehl per SSH auf einem Zielserver aus, "
         "authentifiziert mit dem persoenlichen SSH-Key des aktuellen "
         "Chat-Nutzers. Kein Host- oder Kommando-Filter -- die Rechte "
-        "ergeben sich allein aus dem Ziel-Account des Keys."
+        "ergeben sich allein aus dem Ziel-Account des Keys. "
+        "'username' darf weggelassen werden, wenn er nicht aus dem "
+        "Gespraech hervorgeht -- der Server fragt in diesem Fall den "
+        "Menschen direkt per Formular (nicht das Modell per Fliesstext)."
     ),
     inputSchema={
         "type": "object",
         "properties": {
             "host": {"type": "string", "description": "Hostname oder IP des Zielservers"},
             "port": {"type": "integer", "description": "SSH-Port", "default": 22},
-            "username": {"type": "string", "description": "Login-Benutzername auf dem Zielserver"},
+            "username": {
+                "type": "string",
+                "description": (
+                    "Login-Benutzername auf dem Zielserver. Weglassen, falls "
+                    "unbekannt -- wird dann per Rueckfrage beim Menschen "
+                    "ermittelt, nicht vom Modell erraten."
+                ),
+            },
             "command": {"type": "string", "description": "Auszufuehrender Shell-Befehl"},
             "timeout_seconds": {
                 "type": "integer",
@@ -89,12 +113,55 @@ TOOL = types.Tool(
                 "default": DEFAULT_TIMEOUT_SECONDS,
             },
         },
-        "required": ["host", "username", "command"],
+        # 'username' is deliberately NOT required here (see run_ssh_command's
+        # caller in build_server): making it required would make a
+        # spec-compliant model refuse to call this tool at all without it
+        # and ask in plain text instead -- exactly the behavior elicitation
+        # is meant to replace with a real form.
+        "required": ["host", "command"],
     },
     annotations=types.ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
     ),
 )
+
+USERNAME_ELICIT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "username": {"type": "string", "title": "SSH-Benutzername"},
+    },
+    "required": ["username"],
+}
+
+
+async def elicit_username(session: Any, host: str) -> Optional[str]:
+    """Ask the human directly for the SSH username via MCP elicitation,
+    instead of leaving it to the model to guess or to ask in free text.
+
+    Returns None on anything short of a clean accept -- capability not
+    supported by the client, the request itself failing, or the user
+    declining/cancelling -- so the caller can fall back to a plain
+    missing-argument error the model can still relay as a question.
+    """
+
+    if session is None:
+        return None
+    if not session.check_client_capability(
+        types.ClientCapabilities(elicitation=types.ElicitationCapability()),
+    ):
+        return None
+    try:
+        result = await session.elicit_form(
+            message=f"Mit welchem Benutzernamen soll die SSH-Verbindung zu {host} aufgebaut werden?",
+            requestedSchema=USERNAME_ELICIT_SCHEMA,
+        )
+    except Exception as exc:
+        logger.info("ssh-mcp: elicitation failed, falling back to text (%s)", exc)
+        return None
+    if result.action != "accept" or not result.content:
+        return None
+    value = result.content.get("username")
+    return str(value) if value else None
 
 
 class CredentialError(Exception):
@@ -239,9 +306,11 @@ def build_server(store: HostKeyStore) -> Server:
             return [types.TextContent(type="text", text=json.dumps(payload))]
 
         try:
-            request = server.request_context.request
+            request_context = server.request_context
         except LookupError:
-            request = None
+            request_context = None
+        request = request_context.request if request_context is not None else None
+        session = request_context.session if request_context is not None else None
 
         try:
             key_bytes, passphrase = extract_credentials(request)
@@ -252,13 +321,31 @@ def build_server(store: HostKeyStore) -> Server:
             }
             return [types.TextContent(type="text", text=json.dumps(payload))]
 
+        username = arguments.get("username")
+        if not username:
+            username = await elicit_username(session, host=arguments["host"])
+        if not username:
+            payload = {
+                "ok": False,
+                "error": {
+                    "code": "missing_username",
+                    "message": (
+                        "No username given and the client either doesn't "
+                        "support elicitation or the user declined/cancelled "
+                        "the prompt. Ask the user for the SSH username and "
+                        "retry with it set."
+                    ),
+                },
+            }
+            return [types.TextContent(type="text", text=json.dumps(payload))]
+
         payload = await run_ssh_command(
             store,
             key_bytes,
             passphrase,
             host=arguments["host"],
             port=int(arguments.get("port", 22)),
-            username=arguments["username"],
+            username=username,
             command=arguments["command"],
             timeout_seconds=int(arguments.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
         )

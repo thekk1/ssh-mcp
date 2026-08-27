@@ -9,6 +9,7 @@ from ssh_mcp.app import (
     TOOL,
     CredentialError,
     _TofuClient,
+    elicit_username,
     extract_credentials,
 )
 from ssh_mcp.hostkeys import HostKeyStore
@@ -56,7 +57,7 @@ def test_extract_credentials_passphrase_passed_through():
 def test_tool_has_no_host_or_command_restriction_in_schema():
     props = TOOL.inputSchema["properties"]
     assert set(props) == {"host", "port", "username", "command", "timeout_seconds"}
-    assert TOOL.inputSchema["required"] == ["host", "username", "command"]
+    assert TOOL.inputSchema["required"] == ["host", "command"]
 
 
 class _FakeKey:
@@ -96,3 +97,73 @@ def test_tofu_client_rejects_mismatched_key(tmp_path):
     )
     assert accepted is False
     assert store.get("example.com", 22) == "sha256:aaa"
+
+
+class _FakeElicitResult:
+    def __init__(self, action: str, content: dict | None = None) -> None:
+        self.action = action
+        self.content = content
+
+
+class _FakeSession:
+    def __init__(self, elicitation_supported: bool, result=None, raise_exc=None) -> None:
+        self._elicitation_supported = elicitation_supported
+        self._result = result
+        self._raise_exc = raise_exc
+        self.elicit_calls: list[tuple] = []
+
+    def check_client_capability(self, _capability) -> bool:
+        return self._elicitation_supported
+
+    async def elicit_form(self, message, requestedSchema):
+        self.elicit_calls.append((message, requestedSchema))
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_no_session_returns_none():
+    assert await elicit_username(None, host="example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_unsupported_client_returns_none_and_never_asks():
+    session = _FakeSession(elicitation_supported=False)
+    assert await elicit_username(session, host="example.com") is None
+    assert session.elicit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_accepted_returns_value():
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(action="accept", content={"username": "marc"}),
+    )
+    result = await elicit_username(session, host="10.49.8.87")
+    assert result == "marc"
+    assert "10.49.8.87" in session.elicit_calls[0][0]
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_declined_returns_none():
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(action="decline"),
+    )
+    assert await elicit_username(session, host="example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_cancelled_returns_none():
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(action="cancel"),
+    )
+    assert await elicit_username(session, host="example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_elicit_username_request_failure_falls_back_to_none():
+    session = _FakeSession(elicitation_supported=True, raise_exc=RuntimeError("boom"))
+    assert await elicit_username(session, host="example.com") is None
