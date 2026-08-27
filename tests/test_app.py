@@ -9,7 +9,7 @@ from ssh_mcp.app import (
     TOOL,
     CredentialError,
     _TofuClient,
-    elicit_username,
+    elicit_missing_ssh_args,
     extract_credentials,
 )
 from ssh_mcp.hostkeys import HostKeyStore
@@ -57,7 +57,7 @@ def test_extract_credentials_passphrase_passed_through():
 def test_tool_has_no_host_or_command_restriction_in_schema():
     props = TOOL.inputSchema["properties"]
     assert set(props) == {"host", "port", "username", "command", "timeout_seconds"}
-    assert TOOL.inputSchema["required"] == ["host", "command"]
+    assert TOOL.inputSchema["required"] == ["command"]
 
 
 class _FakeKey:
@@ -123,47 +123,98 @@ class _FakeSession:
 
 
 @pytest.mark.asyncio
-async def test_elicit_username_no_session_returns_none():
-    assert await elicit_username(None, host="example.com") is None
-
-
-@pytest.mark.asyncio
-async def test_elicit_username_unsupported_client_returns_none_and_never_asks():
-    session = _FakeSession(elicitation_supported=False)
-    assert await elicit_username(session, host="example.com") is None
+async def test_elicit_nothing_missing_returns_none_and_never_asks():
+    session = _FakeSession(elicitation_supported=True)
+    result = await elicit_missing_ssh_args(session, {"host": "example.com", "username": "marc"})
+    assert result is None
     assert session.elicit_calls == []
 
 
 @pytest.mark.asyncio
-async def test_elicit_username_accepted_returns_value():
+async def test_elicit_no_session_returns_none():
+    result = await elicit_missing_ssh_args(None, {"host": "example.com"})
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_elicit_unsupported_client_returns_none_and_never_asks():
+    session = _FakeSession(elicitation_supported=False)
+    result = await elicit_missing_ssh_args(session, {"host": "example.com"})
+    assert result is None
+    assert session.elicit_calls == []
+
+
+@pytest.mark.asyncio
+async def test_elicit_only_asks_for_the_missing_fields():
     session = _FakeSession(
         elicitation_supported=True,
         result=_FakeElicitResult(action="accept", content={"username": "marc"}),
     )
-    result = await elicit_username(session, host="10.49.8.87")
-    assert result == "marc"
-    assert "10.49.8.87" in session.elicit_calls[0][0]
+    result = await elicit_missing_ssh_args(session, {"host": "10.49.8.87", "port": 2222})
+    assert result == {"username": "marc"}
+    message, schema = session.elicit_calls[0]
+    assert set(schema["properties"]) == {"username"}
+    assert schema["required"] == ["username"]
 
 
 @pytest.mark.asyncio
-async def test_elicit_username_declined_returns_none():
+async def test_elicit_both_missing_bundles_port_as_prefilled_default():
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(
+            action="accept", content={"host": "10.49.8.87", "username": "marc", "port": 2222},
+        ),
+    )
+    result = await elicit_missing_ssh_args(session, {})
+    assert result == {"host": "10.49.8.87", "username": "marc", "port": 2222}
+    _message, schema = session.elicit_calls[0]
+    assert set(schema["properties"]) == {"host", "username", "port"}
+    assert schema["required"] == ["host", "username"]
+    assert schema["properties"]["port"]["default"] == 22
+
+
+@pytest.mark.asyncio
+async def test_elicit_port_alone_present_is_not_re_offered():
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(action="accept", content={"username": "marc"}),
+    )
+    await elicit_missing_ssh_args(session, {"host": "example.com", "port": 2222})
+    _message, schema = session.elicit_calls[0]
+    assert "port" not in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_elicit_declined_returns_none():
     session = _FakeSession(
         elicitation_supported=True,
         result=_FakeElicitResult(action="decline"),
     )
-    assert await elicit_username(session, host="example.com") is None
+    assert await elicit_missing_ssh_args(session, {"host": "example.com"}) is None
 
 
 @pytest.mark.asyncio
-async def test_elicit_username_cancelled_returns_none():
+async def test_elicit_cancelled_returns_none():
     session = _FakeSession(
         elicitation_supported=True,
         result=_FakeElicitResult(action="cancel"),
     )
-    assert await elicit_username(session, host="example.com") is None
+    assert await elicit_missing_ssh_args(session, {"host": "example.com"}) is None
 
 
 @pytest.mark.asyncio
-async def test_elicit_username_request_failure_falls_back_to_none():
+async def test_elicit_request_failure_falls_back_to_none():
     session = _FakeSession(elicitation_supported=True, raise_exc=RuntimeError("boom"))
-    assert await elicit_username(session, host="example.com") is None
+    assert await elicit_missing_ssh_args(session, {"host": "example.com"}) is None
+
+
+@pytest.mark.asyncio
+async def test_elicit_accept_without_answering_asked_field_is_treated_as_no_answer():
+    # Client says "accept" but the form data doesn't actually cover
+    # something we asked for -- must not be treated as a partial win.
+    session = _FakeSession(
+        elicitation_supported=True,
+        result=_FakeElicitResult(action="accept", content={"port": 22}),
+    )
+    result = await elicit_missing_ssh_args(session, {"host": "example.com"})
+    assert result is None

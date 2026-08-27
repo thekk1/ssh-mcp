@@ -23,15 +23,26 @@ contact to a host:port pins its key fingerprint, every later connection
 must match it exactly or gets refused, rather than trusting every
 handshake unconditionally.
 
-'username' is optional in the tool schema on purpose: when it's missing,
-this server asks the human directly via MCP elicitation (a real form,
-requested through the client, see elicit_username()) instead of leaving
-it to the model to guess or ask in free text. LibreChat's elicitation
-support is unconfirmed/in-progress upstream as of this writing (see
-README) -- elicit_username() checks the client's declared capability
-first and falls back to a plain missing_username error if the client
-doesn't support it, so behavior degrades to "the model asks in text"
-rather than crashing the tool call.
+'host' and 'username' are optional in the tool schema on purpose ('command'
+stays required -- deciding *what to run* is the model's job, not something
+to ask a human for): when either is missing, this server asks the human
+directly via MCP elicitation (one combined form, requested through the
+client, see elicit_missing_ssh_args()) instead of leaving it to the model
+to guess or ask in free text field by field. 'port' rides along in that
+same form, pre-filled with its usual default (22), when a form is already
+being shown for host/username -- a bare missing port on its own still just
+silently defaults, no reason to interrupt for that alone.
+
+As of this writing, confirmed LibreChat does NOT declare MCP elicitation
+support at all (its ClientCapabilities always sends elicitation: null;
+see README) -- the "form" LibreChat users may have seen elsewhere is its
+own separate, non-MCP ask_user_question agent tool, which no MCP server
+(this one included) can trigger. elicit_missing_ssh_args() checks the
+client's declared capability before ever sending a request and falls back
+to a plain missing_host/missing_username error otherwise, so behavior
+degrades to "the model asks in text" today, and activates automatically,
+with no code changes needed here, whenever LibreChat (or any other client)
+adds real elicitation support.
 """
 
 from __future__ import annotations
@@ -75,11 +86,12 @@ _INSTRUCTIONS = (
     "ausschliesslich vom Unix-Account, zu dem der hinterlegte Key gehoert. "
     "Host-Keys werden per Trust-On-First-Use gepinnt -- bei einer "
     "Aenderung gegenueber dem ersten Kontakt schlaegt die Verbindung fehl, "
-    "statt sie stillschweigend zu akzeptieren. Fehlt der SSH-Benutzername, "
-    "wird er per MCP-Elicitation direkt beim Menschen abgefragt (Formular "
-    "mit dem unterstuetzenden Client), nicht vom Modell erraten oder per "
-    "Fliesstext-Rueckfrage erfragt -- Clients ohne Elicitation-Unterstuetzung "
-    "bekommen stattdessen einen klaren missing_username-Fehler zurueck."
+    "statt sie stillschweigend zu akzeptieren. Fehlen Zielserver und/oder "
+    "Benutzername, werden sie per MCP-Elicitation direkt beim Menschen "
+    "abgefragt (ein Formular mit dem unterstuetzenden Client), nicht vom "
+    "Modell erraten oder per Fliesstext-Rueckfrage erfragt -- Clients ohne "
+    "Elicitation-Unterstuetzung bekommen stattdessen einen klaren "
+    "missing_host-/missing_username-Fehler zurueck."
 )
 
 TOOL = types.Tool(
@@ -89,14 +101,23 @@ TOOL = types.Tool(
         "authentifiziert mit dem persoenlichen SSH-Key des aktuellen "
         "Chat-Nutzers. Kein Host- oder Kommando-Filter -- die Rechte "
         "ergeben sich allein aus dem Ziel-Account des Keys. "
-        "'username' darf weggelassen werden, wenn er nicht aus dem "
-        "Gespraech hervorgeht -- der Server fragt in diesem Fall den "
-        "Menschen direkt per Formular (nicht das Modell per Fliesstext)."
+        "'host' und 'username' duerfen weggelassen werden, wenn sie nicht "
+        "aus dem Gespraech hervorgehen -- der Server fragt in diesem Fall "
+        "den Menschen direkt per Formular (nicht das Modell per "
+        "Fliesstext). 'command' dagegen immer angeben -- das zu "
+        "entscheiden ist Aufgabe des Modells, nicht des Menschen."
     ),
     inputSchema={
         "type": "object",
         "properties": {
-            "host": {"type": "string", "description": "Hostname oder IP des Zielservers"},
+            "host": {
+                "type": "string",
+                "description": (
+                    "Hostname oder IP des Zielservers. Weglassen, falls "
+                    "unbekannt -- wird dann per Rueckfrage beim Menschen "
+                    "ermittelt, nicht vom Modell erraten."
+                ),
+            },
             "port": {"type": "integer", "description": "SSH-Port", "default": 22},
             "username": {
                 "type": "string",
@@ -113,55 +134,80 @@ TOOL = types.Tool(
                 "default": DEFAULT_TIMEOUT_SECONDS,
             },
         },
-        # 'username' is deliberately NOT required here (see run_ssh_command's
-        # caller in build_server): making it required would make a
-        # spec-compliant model refuse to call this tool at all without it
+        # 'host'/'username' are deliberately NOT required here (see
+        # elicit_missing_ssh_args()): making them required would make a
+        # spec-compliant model refuse to call this tool at all without them
         # and ask in plain text instead -- exactly the behavior elicitation
-        # is meant to replace with a real form.
-        "required": ["host", "command"],
+        # is meant to replace with a real form. 'command' stays required --
+        # deciding *what to run* is the model's job, not a human's.
+        "required": ["command"],
     },
     annotations=types.ToolAnnotations(
         readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
     ),
 )
 
-USERNAME_ELICIT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "username": {"type": "string", "title": "SSH-Benutzername"},
-    },
-    "required": ["username"],
+# title/default here double as the elicitation form's field hints -- a
+# client that renders ElicitRequestedSchema properly (per the MCP spec)
+# shows 'port''s default pre-filled and editable, not just silently
+# applied like it is in the no-elicitation fallback path.
+_ELICIT_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
+    "host": {"type": "string", "title": "Zielserver (Hostname oder IP)"},
+    "port": {"type": "integer", "title": "SSH-Port", "default": 22},
+    "username": {"type": "string", "title": "SSH-Benutzername"},
 }
 
 
-async def elicit_username(session: Any, host: str) -> Optional[str]:
-    """Ask the human directly for the SSH username via MCP elicitation,
-    instead of leaving it to the model to guess or to ask in free text.
+async def elicit_missing_ssh_args(
+    session: Any, arguments: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Ask the human directly, via one combined MCP elicitation form, for
+    whichever of host/username are missing from arguments -- instead of
+    leaving it to the model to guess or ask in free text field by field.
+    'port' rides along pre-filled in that same form when one is already
+    being shown, but a merely-missing port alone never triggers a form by
+    itself (it has a workable default -- see run_ssh_command's caller).
 
-    Returns None on anything short of a clean accept -- capability not
-    supported by the client, the request itself failing, or the user
-    declining/cancelling -- so the caller can fall back to a plain
-    missing-argument error the model can still relay as a question.
+    Returns a dict of resolved values for the fields that were actually
+    missing, to be merged into arguments by the caller -- or None if there
+    was nothing to elicit, the client doesn't support the capability, the
+    request itself failed, or the user declined/cancelled.
     """
 
+    missing = [field for field in ("host", "username") if not arguments.get(field)]
+    if not missing:
+        return None
     if session is None:
         return None
     if not session.check_client_capability(
         types.ClientCapabilities(elicitation=types.ElicitationCapability()),
     ):
         return None
+
+    properties = {field: dict(_ELICIT_FIELD_SCHEMAS[field]) for field in missing}
+    if "port" not in arguments:
+        properties["port"] = dict(_ELICIT_FIELD_SCHEMAS["port"])
+
     try:
         result = await session.elicit_form(
-            message=f"Mit welchem Benutzernamen soll die SSH-Verbindung zu {host} aufgebaut werden?",
-            requestedSchema=USERNAME_ELICIT_SCHEMA,
+            message="Fuer die SSH-Verbindung fehlen noch Angaben:",
+            requestedSchema={
+                "type": "object",
+                "properties": properties,
+                "required": missing,
+            },
         )
     except Exception as exc:
         logger.info("ssh-mcp: elicitation failed, falling back to text (%s)", exc)
         return None
     if result.action != "accept" or not result.content:
         return None
-    value = result.content.get("username")
-    return str(value) if value else None
+    resolved = {k: v for k, v in result.content.items() if v not in (None, "")}
+    if any(field not in resolved for field in missing):
+        # Client accepted but didn't actually fill in something we asked
+        # for -- treat like any other incomplete answer, not a partial win.
+        return None
+    return resolved
 
 
 class CredentialError(Exception):
@@ -321,19 +367,23 @@ def build_server(store: HostKeyStore) -> Server:
             }
             return [types.TextContent(type="text", text=json.dumps(payload))]
 
-        username = arguments.get("username")
-        if not username:
-            username = await elicit_username(session, host=arguments["host"])
-        if not username:
+        if not arguments.get("host") or not arguments.get("username"):
+            elicited = await elicit_missing_ssh_args(session, arguments)
+            if elicited:
+                arguments = {**arguments, **elicited}
+
+        for field, code in (("host", "missing_host"), ("username", "missing_username")):
+            if arguments.get(field):
+                continue
             payload = {
                 "ok": False,
                 "error": {
-                    "code": "missing_username",
+                    "code": code,
                     "message": (
-                        "No username given and the client either doesn't "
+                        f"No '{field}' given and the client either doesn't "
                         "support elicitation or the user declined/cancelled "
-                        "the prompt. Ask the user for the SSH username and "
-                        "retry with it set."
+                        f"the prompt. Ask the user for the {field} and retry "
+                        "with it set."
                     ),
                 },
             }
@@ -345,7 +395,7 @@ def build_server(store: HostKeyStore) -> Server:
             passphrase,
             host=arguments["host"],
             port=int(arguments.get("port", 22)),
-            username=username,
+            username=arguments["username"],
             command=arguments["command"],
             timeout_seconds=int(arguments.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
         )

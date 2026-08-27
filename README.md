@@ -69,28 +69,48 @@ makes LibreChat's non-OAuth MCP client try (and get stuck on) OAuth.
 Docker network isolation is the transport-level boundary; real access
 control lives one layer up, in LibreChat.
 
-## Missing username: asked via MCP elicitation, not guessed by the model
+## Missing host/username: asked via MCP elicitation, not guessed by the model
 
-`username` is deliberately **not** in the tool's `required` schema fields.
-Making it required would make a spec-compliant model refuse to even call
-the tool without it and improvise a plain-text follow-up question itself
-instead -- which is exactly the bad UX this replaces. When `username` is
-missing, `ssh_mcp/app.py`'s `elicit_username()` asks the *human* directly
-via [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
-(`elicitation/create`, form mode) -- a real client-rendered form, not
-something the model has to phrase itself.
+`host` and `username` are deliberately **not** in the tool's `required`
+schema fields (`command` stays required -- deciding *what to run* is the
+model's job, not a human's). Making host/username required would make a
+spec-compliant model refuse to even call the tool without them and
+improvise a plain-text follow-up question itself instead -- which is
+exactly the bad UX this replaces. When either is missing,
+`ssh_mcp/app.py`'s `elicit_missing_ssh_args()` asks the *human* directly,
+in **one combined form**, via [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+(`elicitation/create`, form mode) -- not something the model has to phrase
+itself, and not two or three separate round trips for host/username/port.
+`port` rides along in that same form, pre-filled with its usual default
+(22) via the schema's `default`, editable but not itself a reason to
+interrupt when it's the only thing unset.
 
-**This degrades safely if the client doesn't support it.** LibreChat's own
-elicitation support is unconfirmed/in-progress upstream as of this writing
-([Discussion #8681](https://github.com/danny-avila/LibreChat/discussions/8681),
-PR #12938) -- not something to build on blindly. `elicit_username()` checks
-`session.check_client_capability(...)` before ever sending the request, and
-catches any failure from the call itself; either way it falls back to a
-plain `missing_username` error the model can still relay as a text
-question, rather than the tool call erroring out or hanging. Verified with
-a real `ClientSession` via `mcp.shared.memory`'s in-memory transport, both
-with and without an `elicitation_callback` registered, plus the
-accept/decline/cancel branches -- not just asserted from reading the spec.
+**This degrades safely if the client doesn't support it.** As of this
+writing, LibreChat's MCP client does **not** implement elicitation at all
+-- confirmed: its `initialize` handshake always sends `elicitation: null`
+in `ClientCapabilities`. (The form-like UI some users may have seen
+elsewhere in LibreChat, `ask_user_question`, is a separate, LibreChat-native
+*agent tool* the model calls directly -- unrelated to the MCP protocol and
+not something any MCP server, this one included, can trigger. Real MCP
+elicitation support remains an open request:
+[Discussion #8681](https://github.com/danny-avila/LibreChat/discussions/8681),
+[Issue #11526](https://github.com/danny-avila/LibreChat/issues/11526).)
+`elicit_missing_ssh_args()` checks `session.check_client_capability(...)`
+before ever sending a request, and catches any failure from the call
+itself; either way it falls back to plain `missing_host`/`missing_username`
+errors the model can still relay as text questions, rather than the tool
+call erroring out or hanging. This is forward-compatible, inert-but-free
+groundwork, not something currently doing anything for LibreChat users --
+kept because it costs nothing and activates automatically the moment any
+client (LibreChat or otherwise) adds real elicitation support, no code
+changes needed here.
+
+Verified with a real `ClientSession` via `mcp.shared.memory`'s in-memory
+transport: with and without an `elicitation_callback` registered, the
+accept/decline/cancel branches, and a full combined form (host + username
+missing, port's default overridden) -- confirmed all three values actually
+reach the SSH call exactly as elicited, not just asserted from reading the
+spec.
 
 ## Restricting visibility to specific users
 
@@ -198,8 +218,8 @@ pytest
 ```
 
 Unit tests (credential-header parsing, TOFU pin/accept/reject logic, tool
-schema, `elicit_username`'s capability-check/accept/decline/cancel/failure
-branches against a fake session) -- no real network, subprocess, or MCP
-transport. The real-handshake scenarios and the real `ClientSession`
-elicitation round trip (see above) were run manually, not part of the
-automated suite.
+schema, `elicit_missing_ssh_args`'s capability-check/field-selection/
+accept/decline/cancel/failure branches against a fake session) -- no real
+network, subprocess, or MCP transport. The real-handshake scenarios and
+the real `ClientSession` elicitation round trips (see above) were run
+manually, not part of the automated suite.
