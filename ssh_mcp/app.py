@@ -1,22 +1,20 @@
-"""ssh-mcp: per-user SSH command execution for LibreChat.
+"""ssh-mcp: per-user SSH command execution over MCP.
 
 One tool, ssh_exec(host, port, username, command) -- no host allowlist, no
-command whitelist. That's a deliberate trade-off, not an oversight: unlike
-jenkins-mcp ("alles ausser Groovy-Konsole"), there's no equivalent of
-Jenkins' own permission matrix to lean on here, because every target host
-is an arbitrary, un-enrolled machine. The only two boundaries are (1)
-which LibreChat users even see this server at all -- enforced outside this
-process, via LibreChat's group/role config-override fed by a Keycloak
-group/role sync, not by anything in here -- and (2) the real Unix
-permissions of whichever personal key a user brings. If (1) or (2) isn't
-in place for a given deployment, this tool is exactly as dangerous as
-handing that user a bare terminal.
+command whitelist. That's a deliberate trade-off, not an oversight: this
+server has no permission model of its own to enforce, because every
+target host is arbitrary and un-enrolled. The only two boundaries are (1)
+who can reach this server and set the credential headers at all --
+entirely up to whatever sits in front of this process, not enforced by
+anything in here -- and (2) the real Unix permissions of whichever
+personal key gets used. If (1) or (2) isn't in place for a given
+deployment, this tool is exactly as dangerous as handing that caller a
+bare terminal. See README ("Security model") for the full reasoning.
 
-Multi-user via LibreChat customUserVars -> per-request headers, same shape
-as ews-mcp/jenkins-mcp: no MCP_API_KEY, no auth gate on the MCP connection
-itself -- a 401 from any such gate makes LibreChat's non-OAuth MCP client
-try (and get stuck on) OAuth. Docker network isolation is the only
-transport-level boundary; everything else is (1) and (2) above.
+Multi-user via per-request credential headers, not server configuration:
+no API key or auth gate on the MCP connection itself -- deliberately, see
+README for why. Network placement is the transport-level boundary;
+everything else is (1) and (2) above.
 
 Host key handling is genuine TOFU (see hostkeys.HostKeyStore) -- first
 contact to a host:port pins its key fingerprint, every later connection
@@ -33,16 +31,13 @@ same form, pre-filled with its usual default (22), when a form is already
 being shown for host/username -- a bare missing port on its own still just
 silently defaults, no reason to interrupt for that alone.
 
-As of this writing, confirmed LibreChat does NOT declare MCP elicitation
-support at all (its ClientCapabilities always sends elicitation: null;
-see README) -- the "form" LibreChat users may have seen elsewhere is its
-own separate, non-MCP ask_user_question agent tool, which no MCP server
-(this one included) can trigger. elicit_missing_ssh_args() checks the
-client's declared capability before ever sending a request and falls back
-to a plain missing_host/missing_username error otherwise, so behavior
-degrades to "the model asks in text" today, and activates automatically,
-with no code changes needed here, whenever LibreChat (or any other client)
-adds real elicitation support.
+Elicitation support varies by MCP client; elicit_missing_ssh_args() checks
+the client's declared capability before ever sending a request and falls
+back to a plain missing_host/missing_username error otherwise, so a client
+without support just gets "the model asks in text" -- and it activates
+automatically, with no code changes needed here, on any client that adds
+real elicitation support later. See README for which clients that
+currently includes.
 """
 
 from __future__ import annotations

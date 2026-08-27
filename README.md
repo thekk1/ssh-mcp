@@ -1,73 +1,93 @@
 # ssh-mcp
 
-Per-user SSH command execution for LibreChat assistants: one tool,
-`ssh_exec(host, port, username, command)`, authenticated with the calling
-chat user's own personal SSH private key -- never a shared service
-account. Deployed as a plain streamable-HTTP Docker service (no `ports:`
-exposed publicly, no per-user OAuth at the MCP layer), same shape as
-`ews-mcp`'s multi-user mode and `jenkins-mcp`.
+An [MCP](https://modelcontextprotocol.io/) server that lets an LLM run
+shell commands over SSH, authenticated with each user's own personal SSH
+key rather than a single shared service account. Built for multi-user
+chat platforms (e.g. [LibreChat](https://www.librechat.ai/)) where the
+server is shared but the SSH identity per request should not be.
 
-## Why this exists (and why it's custom code, not a wrapper)
+One tool: `ssh_exec(host, port, username, command)`. No host allowlist, no
+command whitelist -- see "Security model" below for why, and what that
+means for anyone deploying this.
 
-Unlike Jenkins, where `mcp-jenkins` already ships exactly the header-based
-multi-user auth needed, no existing open-source SSH MCP server checked
-(`vignitin/multi-ssh-mcp`, `giuliolibrando/ssh-mcp-server`,
-`tufantunc/ssh-mcp`) supports per-request credentials at all -- every one
-of them bakes a single host/user/credential into environment variables or
-a config file at startup. So this is a small (~150 line) purpose-built
-server against [`asyncssh`](https://asyncssh.readthedocs.io/), not a
-wrapper around someone else's CLI.
+## Why this exists
+
+A few existing open-source SSH MCP servers were checked before writing
+this one (`vignitin/multi-ssh-mcp`, `giuliolibrando/ssh-mcp-server`,
+`tufantunc/ssh-mcp`). None of them support per-request credentials: every
+one bakes a single host/user/credential into environment variables or a
+config file at startup, which only works for a single-user deployment or
+a shared service account. None of that fits a setup where many different
+people, each with their own SSH key, share one running MCP server.
+
+So this is a small, purpose-built server against
+[`asyncssh`](https://asyncssh.readthedocs.io/) rather than a wrapper
+around an existing tool -- there was nothing suitable to wrap.
 
 ## How it works
 
 ```
-LibreChat --(streamable-http, /mcp, per-user headers)--> ssh-mcp
-                                                              |
-                                                              | asyncssh,
-                                                              | one connection
-                                                              | per tool call
-                                                              v
-                                                        arbitrary target host
+MCP client --(streamable-http, /mcp, per-request headers)--> ssh-mcp
+                                                                  |
+                                                                  | asyncssh,
+                                                                  | one connection
+                                                                  | per tool call
+                                                                  v
+                                                            arbitrary target host
 ```
 
-**Credentials**, via LibreChat's `customUserVars` -> per-request headers
-(same mechanism as `ews-mcp`/`jenkins-mcp`):
+**Credentials travel as per-request HTTP headers**, not server
+configuration:
 
-- `x-ssh-private-key` -- the user's personal private key, **base64-encoded**
+- `x-ssh-private-key` -- the private key to authenticate with, **base64-encoded**
   (a raw multi-line PEM block can't survive as an HTTP header value)
 - `x-ssh-key-passphrase` -- optional, if that key is passphrase-protected
 
-Decoded once per tool call, handed straight to `asyncssh`, never written to
-disk, never cached across requests.
+Both are read fresh on every tool call, decoded, handed straight to
+`asyncssh`, and then discarded -- nothing is written to disk, and nothing
+is cached across requests. It's the calling client's job to attach the
+right headers for the right user; see "Using this with LibreChat" below
+for one way to do that.
 
-**No host allowlist, no command whitelist.** `ssh_exec` accepts whatever
-host/port/username/command the model passes. That's a deliberate
-trade-off, not an oversight: unlike `jenkins-mcp`'s "everything except the
-Groovy console," there's no equivalent built-in permission matrix to lean
-on for an arbitrary SSH target. The only two things standing between a
-chat message and a real shell are:
+**Host keys use genuine trust-on-first-use (TOFU)**, not "accept anything,
+always": the first connection to a given `host:port` pins its key
+fingerprint to a JSON file on disk (`hostkeys.py`); every later connection
+must match that pin exactly or gets refused with `host_key_mismatch`. This
+can't stop a machine-in-the-middle attack on the very first contact with a
+host, but it turns an unannounced key change afterwards -- rotation or a
+real attack -- into a loud, explicit failure instead of a silent hole.
 
-1. **Which LibreChat users can even see this server** -- not enforced by
-   this code at all, see "Restricting visibility" below.
-2. **The real Unix permissions of whatever key a user brings.**
+No API key or bearer-token gate on the MCP connection itself. That's a
+deliberate simplicity choice for a specific deployment shape: a server
+reachable only from a trusted internal network, where the client attaches
+per-user SSH credentials itself (see below) and network placement is the
+actual access boundary. If you're exposing this somewhere less trusted,
+put a gate in front of it -- this project doesn't include one.
 
-If either of those isn't actually in place, this tool is exactly as
-dangerous as handing that user a bare terminal on every host their key
-opens.
+## Security model
 
-**Host keys use genuine TOFU** (`ssh_mcp/hostkeys.py`), not "accept
-anything, always": the first connection to a given `host:port` pins its
-key fingerprint to a JSON file on a volume; every later connection must
-match that pin exactly or gets refused with `host_key_mismatch`. This
-can't stop a MITM on the very first contact with a host, but it turns an
-unannounced key change afterwards -- rotation or a real MITM -- into a
-loud, explicit failure instead of a silent hole.
+`ssh_exec` does not filter which hosts, commands, or users are allowed.
+Whatever host/port/username/command a caller passes gets attempted, full
+stop. That's a deliberate trade-off, not an oversight: filtering by host
+or command from inside the MCP server would be security theater, since
+any caller with a valid key can just SSH there directly outside this tool
+too. The two things that actually stand between a request and a real
+shell are:
 
-No `MCP_API_KEY`, no auth gate on the MCP connection itself --
-deliberately, same reasoning as every other BOS MCP: a 401 from any gate
-makes LibreChat's non-OAuth MCP client try (and get stuck on) OAuth.
-Docker network isolation is the transport-level boundary; real access
-control lives one layer up, in LibreChat.
+1. **Whoever can reach this server and set the credential headers at
+   all** -- entirely outside this code's control. If you're deploying
+   this behind a multi-tenant client, restricting which of your users can
+   even see/use this tool is that client's job (see "Using this with
+   LibreChat" for one concrete way to do it).
+2. **The real Unix permissions attached to whichever key gets used.**
+   `ssh_exec` runs with exactly the authority that key's target account
+   has -- nothing more, nothing less.
+
+If neither of those is actually enforced for a given deployment, this
+tool is exactly as dangerous as handing every caller a bare terminal on
+every host their key can reach. That's the intended model -- SSH's own
+authorization, not a reimplementation of it -- so make sure it's a model
+you actually want before deploying this.
 
 ## Missing host/username: asked via MCP elicitation, not guessed by the model
 
@@ -76,34 +96,26 @@ schema fields (`command` stays required -- deciding *what to run* is the
 model's job, not a human's). Making host/username required would make a
 spec-compliant model refuse to even call the tool without them and
 improvise a plain-text follow-up question itself instead -- which is
-exactly the bad UX this replaces. When either is missing,
-`ssh_mcp/app.py`'s `elicit_missing_ssh_args()` asks the *human* directly,
-in **one combined form**, via [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+exactly the UX this avoids. When either is missing, `elicit_missing_ssh_args()`
+in `ssh_mcp/app.py` asks the *human* directly, in **one combined form**,
+via [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
 (`elicitation/create`, form mode) -- not something the model has to phrase
-itself, and not two or three separate round trips for host/username/port.
-`port` rides along in that same form, pre-filled with its usual default
-(22) via the schema's `default`, editable but not itself a reason to
-interrupt when it's the only thing unset.
+itself, and not separate round trips per field. `port` rides along in
+that same form, pre-filled with its usual default (22) via the schema's
+`default`, editable but not itself a reason to interrupt when it's the
+only thing unset.
 
-**This degrades safely if the client doesn't support it.** As of this
-writing, LibreChat's MCP client does **not** implement elicitation at all
--- confirmed: its `initialize` handshake always sends `elicitation: null`
-in `ClientCapabilities`. (The form-like UI some users may have seen
-elsewhere in LibreChat, `ask_user_question`, is a separate, LibreChat-native
-*agent tool* the model calls directly -- unrelated to the MCP protocol and
-not something any MCP server, this one included, can trigger. Real MCP
-elicitation support remains an open request:
-[Discussion #8681](https://github.com/danny-avila/LibreChat/discussions/8681),
-[Issue #11526](https://github.com/danny-avila/LibreChat/issues/11526).)
-`elicit_missing_ssh_args()` checks `session.check_client_capability(...)`
-before ever sending a request, and catches any failure from the call
-itself; either way it falls back to plain `missing_host`/`missing_username`
-errors the model can still relay as text questions, rather than the tool
-call erroring out or hanging. This is forward-compatible, inert-but-free
-groundwork, not something currently doing anything for LibreChat users --
-kept because it costs nothing and activates automatically the moment any
-client (LibreChat or otherwise) adds real elicitation support, no code
-changes needed here.
+**This degrades safely on a client that doesn't support elicitation.**
+`elicit_missing_ssh_args()` checks the client's declared capability
+(`session.check_client_capability(...)`) before ever sending a request,
+and catches any failure from the call itself; either way it falls back to
+plain `missing_host`/`missing_username` errors the model can still relay
+as text questions, rather than the tool call erroring out or hanging.
+Elicitation support varies by client -- at the time of writing, several
+popular MCP clients (including LibreChat) don't implement it yet, so this
+mostly acts as forward-compatible groundwork today. It costs nothing when
+unsupported and activates automatically on any client that adds real
+elicitation support later, with no changes needed here.
 
 Verified with a real `ClientSession` via `mcp.shared.memory`'s in-memory
 transport: with and without an `elicitation_callback` registered, the
@@ -112,66 +124,14 @@ missing, port's default overridden) -- confirmed all three values actually
 reach the SSH call exactly as elicited, not just asserted from reading the
 spec.
 
-## Restricting visibility to specific users
+## Using this with LibreChat
 
-**No SSO/Bearer validation needed inside this MCP.** LibreChat itself
-(0.8.5+) has a DB-backed config override system (Admin Panel ->
-Configuration Management) that scopes an additional `mcpServers` entry to
-a specific role or group -- at login, a user's effective config is the
-base config merged with whatever overrides apply to them. A user outside
-the group simply doesn't have the `ssh` entry in their resolved config;
-it's not hidden UI, it's absent. Keycloak groups/roles can feed that
-directly via `OPENID_SYNC_GROUPS_FROM_TOKEN` +
-`OPENID_GROUPS_CLAIM_PATH=realm_access.roles` + `OPENID_TREAT_ROLES_AS_GROUPS`.
-
-Two caveats worth checking live before relying on this, not assuming:
-
-- The feature is documented as **"in preview,"** not GA.
-- There was a real bug ([#13172](https://github.com/danny-avila/LibreChat/issues/13172),
-  May 2026) where group-scoped overrides silently didn't apply while
-  role-scoped ones did; closed via PR #13176, but confirm your running
-  LibreChat version actually includes the fix -- put a test user in/out of
-  the group and check whether `ssh` actually (dis)appears, don't just
-  trust the changelog.
-
-## Run
-
-```bash
-docker build -t ssh-mcp .
-docker run --rm -p 8080:8080 -v ssh-mcp-hostkeys:/data ssh-mcp
-```
-
-The `/data` volume is what makes TOFU pins survive a container recreate --
-without it, every redeploy forgets every previously-seen host key and
-re-pins on next contact (not a security hole, just loses the "detect a
-later change" property until the fleet's been re-contacted once).
-
-## Deploy (BOS pattern)
-
-`docker-compose.yml`:
+LibreChat can attach per-user values to MCP request headers via
+[`customUserVars`](https://www.librechat.ai/docs/configuration/librechat_yaml/object_structure/mcp_servers)
+-- each user enters their own key once in Settings, and LibreChat injects
+it into the configured header on every request for that user. `librechat.yaml`:
 
 ```yaml
-  ssh-mcp:
-    build: /home/bos/ssh-mcp   # git clone https://github.com/thekk1/ssh-mcp
-    container_name: ssh-mcp
-    volumes:
-      - ssh-mcp-hostkeys:/data
-    restart: always
-
-volumes:
-  ssh-mcp-hostkeys:
-```
-
-`librechat.yaml` -- both `customUserVars` entries need **both** `title`
-*and* `description`, or LibreChat's config Zod schema fails at startup
-with a confusing multi-branch `invalid_union` error (see `ews-mcp`'s
-jenkins-mcp writeup for the exact failure shape):
-
-```yaml
-mcpSettings:
-  allowedAddresses:
-    - 'ssh-mcp:8080'
-
 mcpServers:
   ssh:
     type: streamable-http
@@ -182,15 +142,67 @@ mcpServers:
       X-SSH-Key-Passphrase: '{{SSH_KEY_PASSPHRASE}}'
     customUserVars:
       SSH_PRIVATE_KEY:
-        title: "SSH-Private-Key (Base64)"
-        description: "Dein persoenlicher SSH-Private-Key, Base64-kodiert: `base64 -w0 ~/.ssh/id_ed25519`"
+        title: "SSH Private Key (Base64)"
+        description: "Your personal SSH private key, base64-encoded: `base64 -w0 ~/.ssh/id_ed25519`"
       SSH_KEY_PASSPHRASE:
-        title: "SSH-Key-Passphrase (optional)"
-        description: "Nur ausfuellen, falls dein privater Key passphrase-geschuetzt ist"
+        title: "SSH Key Passphrase (optional)"
+        description: "Only fill in if your private key is passphrase-protected"
 ```
 
-Restart LibreChat after editing -- `librechat.yaml` is read once at
-container startup, no hot-reload.
+Both `customUserVars` entries need **both** `title` *and* `description` --
+a `title`-only entry fails LibreChat's config validation at startup with a
+`ZodError` that, confusingly, gets reported against unrelated-looking
+fields (LibreChat validates the whole `mcpServers` block as one union of
+transport types, so one missing field surfaces as several apparently
+unrelated errors at once). `librechat.yaml` is only read at container
+startup -- restart LibreChat after editing it.
+
+### Restricting which users can see this server
+
+Nothing in this project restricts who can use it -- any user who can set
+the `SSH_PRIVATE_KEY` header can call `ssh_exec`. If you need to limit
+that to a subset of your users, that has to happen in LibreChat (or
+whatever client you're using), not here. As of LibreChat 0.8.5+, its
+admin panel has a config-override system (Configuration Management) that
+can scope an additional `mcpServers` entry to a specific role or group --
+a user outside that group has no `ssh` entry in their resolved config at
+all, not just a hidden one. Two things worth checking against your own
+LibreChat version before relying on this, rather than assuming:
+
+- It's documented as **"in preview,"** not GA, as of this writing.
+- There's a known history of group-scoped overrides silently not applying
+  while role-scoped ones did ([danny-avila/LibreChat#13172](https://github.com/danny-avila/LibreChat/issues/13172)).
+  Confirm the fix is in your running version by testing directly -- put a
+  user in/out of the group and check whether the server actually
+  (dis)appears for them.
+
+## Run
+
+```bash
+docker build -t ssh-mcp .
+docker run --rm -p 8080:8080 -v ssh-mcp-hostkeys:/data ssh-mcp
+```
+
+The `/data` volume is what makes TOFU host-key pins survive a container
+recreate -- without it, every redeploy forgets every previously-seen host
+key and re-pins on next contact (not a security hole, just a temporary
+loss of the "detect a later change" property until each host has been
+re-contacted once).
+
+Example `docker-compose.yml` service, building from a local clone:
+
+```yaml
+services:
+  ssh-mcp:
+    build: .
+    container_name: ssh-mcp
+    volumes:
+      - ssh-mcp-hostkeys:/data
+    restart: always
+
+volumes:
+  ssh-mcp-hostkeys:
+```
 
 ## Verify
 
